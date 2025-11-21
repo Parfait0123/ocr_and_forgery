@@ -8,3 +8,4 @@ gdown==5.2.0
 opencv-python-headless==4.10.0.84
 accelerate==0.34.0
 protobuf==3.20.3
+unsloth

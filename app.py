@@ -9,8 +9,9 @@ import tempfile
 import gdown
 import json
 from torchvision import transforms, models
-from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 import re
+import cv2
+import pytesseract
 
 # Configuration de la page
 st.set_page_config(
@@ -139,42 +140,6 @@ def download_from_drive(file_id, output_path):
         st.error(f"Erreur lors du téléchargement: {str(e)}")
         return False
 
-# Fonction pour charger le modèle OCR
-@st.cache_resource
-def load_ocr_model(model_id):
-    """Charge le modèle Qwen2.5-VL fine-tuné"""
-    try:
-        with st.spinner("Chargement du modèle OCR..."):
-            temp_dir = tempfile.mkdtemp()
-            model_path = os.path.join(temp_dir, "qwen_model")
-            
-            if model_id:
-                # Télécharger depuis Google Drive
-                if not download_from_drive(model_id, model_path + ".zip"):
-                    return None, None
-                
-                # Décompresser si nécessaire
-                import zipfile
-                if os.path.exists(model_path + ".zip"):
-                    with zipfile.ZipFile(model_path + ".zip", 'r') as zip_ref:
-                        zip_ref.extractall(model_path)
-            else:
-                # Utiliser le modèle de base
-                model_path = "Qwen/Qwen2.5-VL-7B-Instruct"
-            
-            processor = AutoProcessor.from_pretrained(model_path)
-            model = Qwen2VLForConditionalGeneration.from_pretrained(
-                model_path,
-                torch_dtype=torch.float16,
-                device_map="auto"
-            )
-            
-            st.success("Modèle OCR chargé avec succès")
-            return model, processor
-    except Exception as e:
-        st.error(f"Erreur lors du chargement du modèle OCR: {str(e)}")
-        return None, None
-
 # Fonction pour charger le modèle de classification
 @st.cache_resource
 def load_classifier_model(model_id):
@@ -198,24 +163,150 @@ def load_classifier_model(model_id):
         st.error(f"Erreur lors du chargement du modèle de classification: {str(e)}")
         return None
 
-# Prompts pour l'extraction OCR
-EXTRACTION_PROMPTS = {
-    "arizona_dl": """Analyze the ID card image with extreme precision and extract ONLY the visibly present information.
+# Fonction pour charger le modèle OCR avec Unsloth
+@st.cache_resource
+def load_ocr_model_unsloth(model_id):
+    """Charge le modèle Qwen2.5-VL fine-tuné avec Unsloth"""
+    try:
+        with st.spinner("Installation et chargement d'Unsloth..."):
+            # Installation d'Unsloth
+            import subprocess
+            import sys
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "unsloth"])
+            
+            from unsloth import FastVisionModel
+            import torch
+            
+            temp_dir = tempfile.mkdtemp()
+            model_path = os.path.join(temp_dir, "qwen_model")
+            
+            if model_id:
+                # Télécharger depuis Google Drive
+                if not download_from_drive(model_id, model_path + ".zip"):
+                    return None, None
+                
+                # Décompresser
+                import zipfile
+                if os.path.exists(model_path + ".zip"):
+                    with zipfile.ZipFile(model_path + ".zip", 'r') as zip_ref:
+                        zip_ref.extractall(model_path)
+            else:
+                # Utiliser le modèle de base
+                model_path = "Qwen/Qwen2.5-VL-7B-Instruct"
+            
+            # Charger avec Unsloth
+            model, tokenizer = FastVisionModel.from_pretrained(
+                model_path,
+                max_seq_length=2048,
+                dtype=None,
+                load_in_4bit=True,
+            )
+            
+            st.success("Modèle OCR (Unsloth) chargé avec succès")
+            return model, tokenizer
+            
+    except Exception as e:
+        st.error(f"Erreur lors du chargement du modèle OCR Unsloth: {str(e)}")
+        return None, None
+
+# Fonctions de prétraitement d'image pour OCR de secours
+def preprocess_image(image):
+    """Prétraite l'image pour améliorer l'OCR"""
+    img = np.array(image)
+    
+    if len(img.shape) == 3:
+        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    else:
+        gray = img
+    
+    gray = cv2.medianBlur(gray, 3)
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    )
+    
+    return Image.fromarray(thresh)
+
+def extract_text_tesseract(image):
+    """Extrait le texte avec Tesseract OCR (solution de secours)"""
+    try:
+        processed_image = preprocess_image(image)
+        custom_config = r'--oem 3 --psm 6 -l eng+fra+spa+rus'
+        text = pytesseract.image_to_string(np.array(processed_image), config=custom_config)
+        return text
+    except Exception as e:
+        return f"Erreur Tesseract: {str(e)}"
+
+# Prompts pour l'extraction OCR (identique à votre notebook)
+EXTRACTION_PROMPT = """Analyze the ID card image with extreme precision and extract ONLY the visibly present information.
+
+**CARD TYPE IDENTIFICATION:**
+First determine the exact card type by examining these key characteristics:
+- **USA**: Contains physical attributes (height, weight, eye color), address field, and MM/DD/YYYY date format
+- **RUS**: Written in Cyrillic characters, includes patronymic_name field, uses DD.MM.YYYY date format with dots
+- **EST**: Shows "PD" type designation, "EST" country codes, uses DD.MM.YYYY date format with dots
+- **ESP**: Contains second_surname field, uses DD MM YYYY date format with spaces as separators
+
+**EXACT FIELD REQUIREMENTS FOR EACH CARD TYPE:**
 
 **USA CARD - Output this exact structure:**
 {
-"name": "Complete full name as printed on card (first, middle, last)",
-"address": "Complete street address including city, state, and ZIP code",
-"birthday": "Date of birth in MM/DD/YYYY format only",
-"gender": "Single character: M for Male or F for Female",
-"class": "License class designation (D, C, etc.)",
-"issue_date": "Issue date in MM/DD/YYYY format only",
-"expire_date": "Expiration date in MM/DD/YYYY format only",
-"license_number": "Driver license number exactly as printed",
-"height": "Height measurement with units (e.g., 5'-07\\")",
-"weight": "Weight measurement with units (e.g., 115 lb)",
-"eye_color": "Eye color abbreviation (BRO, BLU, GRN, etc.)",
-"DD": "Document discriminator number"
+    "name": "Complete full name as printed on card (first, middle, last)",
+    "address": "Complete street address including city, state, and ZIP code",
+    "birthday": "Date of birth in MM/DD/YYYY format only",
+    "gender": "Single character: M for Male or F for Female",
+    "class": "License class designation (D, C, etc.)",
+    "issue_date": "Issue date in MM/DD/YYYY format only",
+    "expire_date": "Expiration date in MM/DD/YYYY format only",
+    "license_number": "Driver license number exactly as printed",
+    "height": "Height measurement with units (e.g., 5'-07\")",
+    "weight": "Weight measurement with units (e.g., 115 lb)",
+    "eye_color": "Eye color abbreviation (BRO, BLU, GRN, etc.)",
+    "DD": "Document discriminator number"
+}
+
+**RUS CARD - Output this exact structure:**
+{
+    "country_code": "Always 'RUS'",
+    "surname": "Family name in Cyrillic characters exactly as printed",
+    "given_name": "First name in Cyrillic characters exactly as printed",
+    "birthday": "Date of birth in DD.MM.YYYY format with dots",
+    "issue_date": "Issue date in DD.MM.YYYY format with dots",
+    "expire_date": "Expiration date in DD.MM.YYYY format with dots",
+    "gender": "Either 'ЖЕН' for female or 'МУЖ' for male",
+    "patronymic_name": "Patronymic name in Cyrillic characters exactly as printed",
+    "place_of_birth": "City/place of birth in Cyrillic characters exactly as printed",
+    "card_num": "Card identification number with spaces as shown"
+}
+
+**EST CARD - Output this exact structure:**
+{
+    "type": "Always 'PD'",
+    "country_code": "Always 'EST'",
+    "country": "Always 'EST'",
+    "surname": "Family name exactly as printed in Latin characters",
+    "given_name": "First name exactly as printed in Latin characters",
+    "birthday": "Date of birth in DD.MM.YYYY format with dots",
+    "gender": "Either 'M' for male or 'N/F' for female",
+    "issue_date": "Issue date in DD.MM.YYYY format with dots",
+    "expire_date": "Expiration date in DD.MM.YYYY format with dots",
+    "place_of_birth": "Country of birth (typically 'EST')",
+    "issue_authority": "Issuing authority abbreviation (e.g., 'PPA')",
+    "personal_num": "Personal identification number without spaces",
+    "card_num": "Card number exactly as printed"
+}
+
+**ESP CARD - Output this exact structure:**
+{
+    "country_code": "Always 'ESP'",
+    "surname": "Primary family name exactly as printed",
+    "given_name": "First name exactly as printed",
+    "birthday": "Date of birth in DD MM YYYY format with spaces",
+    "issue_date": "Issue date in DD MM YYYY format with spaces",
+    "expire_date": "Expiration date in DD MM YYYY format with spaces",
+    "gender": "Single character: 'M' for male or 'F' for female",
+    "second_surname": "Secondary family name exactly as printed",
+    "card_num": "Card identification number with letters/numbers as shown",
+    "personal_num": "Personal identification number exactly as printed"
 }
 
 **CRITICAL EXTRACTION RULES:**
@@ -223,107 +314,34 @@ EXTRACTION_PROMPTS = {
 - DO NOT invent, assume, or hallucinate any information
 - If a field is not visible or cannot be read, OMIT it completely from the JSON output
 - Preserve exact spelling, capitalization, spacing, and special characters
-- Output ONLY the raw JSON object without any additional text
+- Maintain the precise date format specified for each card type
+- Output ONLY the raw JSON object without any additional text, explanations, or formatting
+- Do not translate any text - preserve original language and characters
 
-RESPOND ONLY WITH THE REQUIRED JSON OBJECT.""",
+RESPOND ONLY WITH THE REQUIRED JSON OBJECT AND WITH THE EXACT STRUCTURE AS MENTIONED.
+"""
 
-    "rus": """Analyze the ID card image with extreme precision and extract ONLY the visibly present information.
-
-**RUS CARD - Output this exact structure:**
-{
-"country_code": "Always 'RUS'",
-"surname": "Family name in Cyrillic characters exactly as printed",
-"given_name": "First name in Cyrillic characters exactly as printed",
-"birthday": "Date of birth in DD.MM.YYYY format with dots",
-"issue_date": "Issue date in DD.MM.YYYY format with dots",
-"expire_date": "Expiration date in DD.MM.YYYY format with dots",
-"gender": "Either 'ЖЕН' for female or 'МУЖ' for male",
-"patronymic_name": "Patronymic name in Cyrillic characters exactly as printed",
-"place_of_birth": "City/place of birth in Cyrillic characters exactly as printed",
-"card_num": "Card identification number with spaces as shown"
-}
-
-**CRITICAL EXTRACTION RULES:**
-- Extract ONLY text that is clearly visible and legible in the image
-- DO NOT invent, assume, or hallucinate any information
-- Preserve original language and characters
-- Output ONLY the raw JSON object without any additional text
-
-RESPOND ONLY WITH THE REQUIRED JSON OBJECT.""",
-
-    "est": """Analyze the ID card image with extreme precision and extract ONLY the visibly present information.
-
-**EST CARD - Output this exact structure:**
-{
-"type": "Always 'PD'",
-"country_code": "Always 'EST'",
-"country": "Always 'EST'",
-"surname": "Family name exactly as printed in Latin characters",
-"given_name": "First name exactly as printed in Latin characters",
-"birthday": "Date of birth in DD.MM.YYYY format with dots",
-"gender": "Either 'M' for male or 'N/F' for female",
-"issue_date": "Issue date in DD.MM.YYYY format with dots",
-"expire_date": "Expiration date in DD.MM.YYYY format with dots",
-"place_of_birth": "Country of birth (typically 'EST')",
-"issue_authority": "Issuing authority abbreviation (e.g., 'PPA')",
-"personal_num": "Personal identification number without spaces",
-"card_num": "Card number exactly as printed"
-}
-
-**CRITICAL EXTRACTION RULES:**
-- Extract ONLY text that is clearly visible and legible in the image
-- DO NOT invent, assume, or hallucinate any information
-- Output ONLY the raw JSON object without any additional text
-
-RESPOND ONLY WITH THE REQUIRED JSON OBJECT.""",
-
-    "esp": """Analyze the ID card image with extreme precision and extract ONLY the visibly present information.
-
-**ESP CARD - Output this exact structure:**
-{
-"country_code": "Always 'ESP'",
-"surname": "Primary family name exactly as printed",
-"given_name": "First name exactly as printed",
-"birthday": "Date of birth in DD MM YYYY format with spaces",
-"issue_date": "Issue date in DD MM YYYY format with spaces",
-"expire_date": "Expiration date in DD MM YYYY format with spaces",
-"gender": "Single character: 'M' for male or 'F' for female",
-"second_surname": "Secondary family name exactly as printed",
-"card_num": "Card identification number with letters/numbers as shown",
-"personal_num": "Personal identification number exactly as printed"
-}
-
-**CRITICAL EXTRACTION RULES:**
-- Extract ONLY text that is clearly visible and legible in the image
-- DO NOT invent, assume, or hallucinate any information
-- Output ONLY the raw JSON object without any additional text
-
-RESPOND ONLY WITH THE REQUIRED JSON OBJECT."""
-}
-
-# Fonction d'extraction OCR
-def extract_info_ocr(image, card_type, ocr_model, processor):
-    """Extrait les informations de la carte avec le modèle OCR"""
+# Fonction d'extraction OCR avec Unsloth
+def extract_info_ocr_unsloth(image, ocr_model, tokenizer):
+    """Extrait les informations avec le modèle Unsloth"""
     try:
-        prompt = EXTRACTION_PROMPTS.get(card_type, EXTRACTION_PROMPTS["arizona_dl"])
-        
         messages = [
             {
                 "role": "user",
                 "content": [
                     {"type": "image"},
-                    {"type": "text", "text": prompt}
+                    {"type": "text", "text": EXTRACTION_PROMPT}
                 ]
             }
         ]
         
-        input_text = processor.apply_chat_template(
+        input_text = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True
         )
         
-        inputs = processor(
+        inputs = tokenizer(
             text=[input_text],
             images=[image],
             return_tensors="pt",
@@ -339,7 +357,7 @@ def extract_info_ocr(image, card_type, ocr_model, processor):
         
         input_length = inputs.input_ids.shape[1]
         response_ids = output[0][input_length:]
-        response = processor.decode(response_ids, skip_special_tokens=True)
+        response = tokenizer.decode(response_ids, skip_special_tokens=True)
         
         # Extraire le JSON de la réponse
         try:
@@ -349,7 +367,7 @@ def extract_info_ocr(image, card_type, ocr_model, processor):
                 json_object = json.loads(json_string)
                 return json_object
             else:
-                return {"error": "Aucun JSON trouvé dans la réponse"}
+                return {"error": "Aucun JSON trouvé dans la réponse", "raw_response": response}
         except json.JSONDecodeError:
             return {"error": "Format JSON invalide", "raw_response": response}
             
@@ -405,7 +423,7 @@ def main():
         </div>
         """, unsafe_allow_html=True)
         
-        st.subheader("Modèle OCR (Qwen2.5-VL)")
+        st.subheader("Modèle OCR (Qwen2.5-VL Unsloth)")
         ocr_model_id = st.text_input(
             "ID Google Drive - Modèle OCR fine-tuné",
             placeholder="1ABC...XYZ (optionnel)",
@@ -423,23 +441,10 @@ def main():
         
         st.markdown("---")
         
-        st.subheader("Type de Carte")
-        card_type = st.selectbox(
-            "Sélectionnez le type de carte",
-            ["arizona_dl", "rus", "est", "esp"],
-            help="Choisissez le type correspondant à votre document"
-        )
-        
-        card_labels = {
-            "arizona_dl": "Permis de conduire Arizona (USA)",
-            "rus": "Carte d'identité Russe",
-            "est": "Carte d'identité Estonienne",
-            "esp": "Carte d'identité Espagnole"
-        }
-        
-        st.info(f"**Type sélectionné:** {card_labels[card_type]}")
-        
-        st.markdown("---")
+        st.info("""
+        **Note:** Le modèle OCR utilise Unsloth pour le fine-tuning.
+        Si le modèle OCR n'est pas disponible, Tesseract sera utilisé comme solution de secours.
+        """)
         
         load_button = st.button("Charger les Modèles", type="primary")
         
@@ -447,7 +452,7 @@ def main():
         st.markdown("""
         <div style="font-size: 0.85rem; color: #666;">
         <strong>Technologies</strong><br>
-        - OCR: Qwen2.5-VL-7B<br>
+        - OCR: Qwen2.5-VL-7B + Unsloth<br>
         - Classification: EfficientNetV2<br>
         - Framework: PyTorch + Streamlit
         </div>
@@ -458,9 +463,8 @@ def main():
         if not classifier_id:
             st.error("Veuillez fournir l'ID du modèle de classification.")
         else:
-            st.session_state.ocr_model, st.session_state.processor = load_ocr_model(ocr_model_id if ocr_model_id else None)
+            st.session_state.ocr_model, st.session_state.ocr_tokenizer = load_ocr_model_unsloth(ocr_model_id if ocr_model_id else None)
             st.session_state.classifier_model = load_classifier_model(classifier_id)
-            st.session_state.card_type = card_type
     
     # Vérifier si les modèles sont chargés
     if 'classifier_model' not in st.session_state or st.session_state.classifier_model is None:
@@ -529,7 +533,6 @@ def main():
             
             st.write(f"**Nom:** {uploaded_file.name}")
             st.write(f"**Dimensions:** {image.size[0]} x {image.size[1]} pixels")
-            st.write(f"**Type de carte:** {card_labels[st.session_state.card_type]}")
             
             st.markdown("</div>", unsafe_allow_html=True)
         
@@ -571,20 +574,29 @@ def main():
                         """, unsafe_allow_html=True)
                 
                 # Extraction OCR
+                st.markdown('<p class="section-header">2. Extraction des Informations (OCR)</p>', unsafe_allow_html=True)
+                
                 if 'ocr_model' in st.session_state and st.session_state.ocr_model is not None:
-                    st.markdown('<p class="section-header">2. Extraction des Informations (OCR)</p>', unsafe_allow_html=True)
-                    
-                    ocr_result = extract_info_ocr(
-                        image, 
-                        st.session_state.card_type,
+                    # Utiliser le modèle Unsloth
+                    ocr_result = extract_info_ocr_unsloth(
+                        image,
                         st.session_state.ocr_model,
-                        st.session_state.processor
+                        st.session_state.ocr_tokenizer
                     )
-                    
-                    if 'error' in ocr_result:
-                        st.warning(f"OCR: {ocr_result['error']}")
-                        if 'raw_response' in ocr_result:
-                            st.text(ocr_result['raw_response'])
+                else:
+                    # Solution de secours avec Tesseract
+                    st.warning("Utilisation de Tesseract OCR (solution de secours)")
+                    extracted_text = extract_text_tesseract(image)
+                    ocr_result = {"extracted_text": extracted_text, "method": "tesseract"}
+                
+                if 'error' in ocr_result:
+                    st.warning(f"OCR: {ocr_result['error']}")
+                    if 'raw_response' in ocr_result:
+                        st.text_area("Réponse brute:", ocr_result['raw_response'], height=200)
+                else:
+                    if 'method' in ocr_result and ocr_result['method'] == 'tesseract':
+                        st.markdown("**Texte extrait (Tesseract):**")
+                        st.text_area("", ocr_result['extracted_text'], height=200)
                     else:
                         st.markdown("**Informations extraites:**")
                         st.markdown(f"""
@@ -594,29 +606,27 @@ def main():
                         """, unsafe_allow_html=True)
                         
                         # Affichage formaté des informations clés
-                        st.markdown("**Résumé des informations:**")
-                        col1, col2 = st.columns(2)
-                        
-                        keys = list(ocr_result.keys())
-                        mid = len(keys) // 2
-                        
-                        with col1:
-                            for key in keys[:mid]:
-                                st.write(f"**{key}:** {ocr_result[key]}")
-                        
-                        with col2:
-                            for key in keys[mid:]:
-                                st.write(f"**{key}:** {ocr_result[key]}")
-                else:
-                    st.info("Modèle OCR non chargé. Seule la classification est disponible.")
+                        if isinstance(ocr_result, dict):
+                            st.markdown("**Résumé des informations:**")
+                            col1, col2 = st.columns(2)
+                            
+                            keys = list(ocr_result.keys())
+                            mid = len(keys) // 2
+                            
+                            with col1:
+                                for key in keys[:mid]:
+                                    st.write(f"**{key}:** {ocr_result[key]}")
+                            
+                            with col2:
+                                for key in keys[mid:]:
+                                    st.write(f"**{key}:** {ocr_result[key]}")
                 
                 # Bouton de téléchargement des résultats
                 st.markdown("---")
                 results = {
                     "filename": uploaded_file.name,
-                    "card_type": st.session_state.card_type,
                     "classification": classification_result,
-                    "ocr_extraction": ocr_result if 'ocr_model' in st.session_state else None
+                    "ocr_extraction": ocr_result
                 }
                 
                 json_str = json.dumps(results, indent=2, ensure_ascii=False)
